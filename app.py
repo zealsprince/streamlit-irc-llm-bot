@@ -77,6 +77,7 @@ def section_irc_connect():
         add_to_irc_log(f"Joined channel: {event.target}")
 
     def on_disconnect(connection, event):
+
         add_to_irc_log(
             f"Disconnected from the server. {
                 event.arguments[0]
