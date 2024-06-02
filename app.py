@@ -1,5 +1,6 @@
 import time
-
+import ssl
+import socket
 import streamlit as st
 import irc.client
 from llama_cpp import Llama
@@ -63,15 +64,22 @@ def section_irc_connect():
     st.header("IRC Connection")
 
     server = st.text_input("Server:", "irc.hivecom.net")
-    port = st.number_input("Port:", 6697)
+    port = st.number_input("Port:", 0, 65535, 6697, 1)
     nickname = st.text_input("Nickname:", "llm_bot")
     channel = st.text_input("Channel:", "#llm")
+    use_ssl = st.checkbox("Use SSL", True)
 
     irc_client = irc.client.Reactor()
 
+    def on_any(connection, event):
+        add_to_irc_log(f"{event.arguments[0]}")
+
+        if ("PING" in event.arguments[0]):
+            irc_connection.pong("PONG")
+
     def on_connect(connection, event):
-        add_to_irc_log("Connected to the server.")
-        connection.join(channel)
+        add_to_irc_log(f"Connected to the server {
+                       server}. Now joining {channel}...")
 
     def on_join(connection, event):
         add_to_irc_log(f"Joined channel: {event.target}")
@@ -79,7 +87,7 @@ def section_irc_connect():
     def on_disconnect(connection, event):
 
         add_to_irc_log(
-            f"Disconnected from the server. {
+            f"Disconnected from the server: {
                 event.arguments[0]
             }",
             # We don't want to refresh as this can interrupt the disconnect process.
@@ -100,8 +108,20 @@ def section_irc_connect():
 
     if st.button("Connect"):
         try:
+            # Create the SSL factory for the IRC connection over TLS.
+            def ssl_factory(address):
+                context = ssl.create_default_context()
+
+                # Optionally set if you want to verify the server's certificate
+                context.verify_mode = ssl.CERT_REQUIRED
+
+                sock = socket.create_connection(address)
+
+                return context.wrap_socket(sock, server_hostname=address[0])
+
             # Connect to the server.
-            irc_connection = irc_client.server().connect(server, port, nickname)
+            irc_connection = irc_client.server().connect(
+                server, port, nickname, connect_factory=ssl_factory if use_ssl else socket.create_connection)
 
             # Register event handlers.
             irc_connection.add_global_handler("welcome", on_connect)
@@ -111,9 +131,15 @@ def section_irc_connect():
             irc_connection.add_global_handler("pubmsg", on_pubmsg)
             irc_connection.add_global_handler("action", on_action)
 
+            # Debug handler.
+            irc_connection.add_global_handler("all_events", on_any)
+
             # Make the IRC client and connection available in the Streamlit session state.
             st.session_state.irc_client = irc_client
             st.session_state.irc_connection = irc_connection
+
+            # Join the channel.
+            irc_connection.join(channel)
 
             st.rerun()
 
@@ -130,12 +156,17 @@ def section_irc_content():
     if st.button("Disconnect"):
         st.session_state.irc_connection.disconnect("Leaving")
 
+        st.session_state.irc_log = []
         st.session_state.irc_client = None
         st.session_state.irc_connection = None
 
         st.rerun()
 
-    st.write(st.session_state.irc_log)
+    if len(st.session_state.irc_log) == 0:
+        st.info("Connecting...")
+
+    else:
+        st.code("\n".join(st.session_state.irc_log), language="text")
 
 
 def section_prompt_response(llm, role, prompt, parameters={
@@ -308,7 +339,7 @@ def main():
     section_prompt()
 
     while True:
-        time.sleep(1)
+        time.sleep(.1)
 
         if st.session_state.irc_connection:
             st.session_state.irc_client.process_once()
