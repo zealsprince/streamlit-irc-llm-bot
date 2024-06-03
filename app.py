@@ -5,7 +5,6 @@ import streamlit as st
 import irc.client
 from llama_cpp import Llama
 
-
 @st.cache_resource
 def load_model(model_path):
     """Load a Llama model from a given path.
