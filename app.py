@@ -1,11 +1,14 @@
+import os
 import time
 import ssl
 import socket
-import irc.connection
-import irc.server
+
 import streamlit as st
 import irc.client
+
 from llama_cpp import Llama
+
+MODELS_PATH = "models"
 
 DEFAULT_SERVER = "irc.hivecom.net"
 DEFAULT_PORT = 6697
@@ -13,126 +16,68 @@ DEFAULT_NICKNAME = "llm_bot"
 DEFAULT_CHANNEL = "#bots"
 DEFAULT_BACKLOG_LENGTH = 25
 
-DEFAULT_ROLE = "You are an assistant that will answer questions to the best of their abilities. Limit your responses to 25 words."
-DEFAULT_PREPROMPT = "Given the following prompt, please respond with a relevant answer"
+DEFAULT_AUTORESPOND_ENABLED = True
+DEFAULT_AUTORESPOND_INTERVAL = 5
+
+DEFAULT_ROLE = "You are user in an IRC chat. Don't preface your response or use quotes. Limit your responses to a maximum of 32 words."
+DEFAULT_PREPROMPT = ""
 DEFAULT_PROMPT = "Tell a funny joke!"
 
 
-@st.cache_resource
-def load_model(model_path):
-    """Load a Llama model from a given path.
+def clean_message(message: str):
+    """Clean a message for IRC by removing newlines, carriage returns, and the [INST] and [/INST] tags."""
 
-    Args:
-        model_path (str): The path to the model file.
-    """
-    llm = Llama(model_path, seed=-1)
-
-    return llm
-
-
-def section_load_model():
-    """Load the LLM model as a Streamlit section."""
-
-    if st.session_state.model_data:
-        return
-
-    st.header("Prompt")
-
-    # Input box for model path
-    model_path = st.text_input(
-        "Enter the path to your GGUF model file:", "models/tinyllama-1.1b-chat-v1.0.Q5_K_M.gguf")
-
-    if st.button("Load"):
-        # Check if a model path is provided
-        if model_path:
-            st.spinner("Loading model...")
-
-            # Load the model
-            llm = load_model(model_path)
-
-            st.session_state.model_data = llm
-
-            # Since the fundamental state of the app has changed, re-run the app.
-            st.rerun()
-
-    return
+    return message[:256].replace(  # Limit the message to 256 characters
+        "\n", " "
+    ).replace(
+        "\r", " "
+    ).replace(
+        "[INST]", ""
+    ).replace(
+        "[/INST]", ""
+    ).strip()
 
 
 def send_to_channel(channel: str, nickname: str, message: str):
-    """Send a message to the IRC channel in the Streamlit session state. Limit the message to 256 characters."""
-    message = message[:256].replace(  # Limit the message to 256 characters
-        "\n", ""  # Replace newlines with periods
-    ).replace(  # Replace carriage returns with periods
-        "\r", ""
-    )
+    """Send a message to the IRC channel in the Streamlit session state."""
 
-    st.session_state.irc_connection.privmsg(channel, message)
+    cleaned_message = clean_message(message)
+
+    st.session_state.irc_connection.privmsg(channel, cleaned_message)
 
     add_to_irc_log(
-        f"{channel} <{nickname}>: {message}",
+        f"{channel} <{nickname}>: {cleaned_message}",
         refresh=False
     )
 
 
 def send_to_user(user: str, nickname: str, message: str):
-    """Send a message to a user. Limit the message to 256 characters."""
-    message = message[:256].replace(  # Limit the message to 256 characters
-        "\n", ""  # Replace newlines with periods
-    ).replace(  # Replace carriage returns with periods
-        "\r", ""
-    )
+    """Send a message to a user."""
 
-    st.session_state.irc_connection.privmsg(user, message)
+    cleaned_message = clean_message(message)
+
+    st.session_state.irc_connection.privmsg(user, cleaned_message)
 
     add_to_irc_log(
-        f"PRIVMSG <{nickname}>:<{user}>: {message}",
+        f"PRIVMSG <{nickname}>:<{user}>: {cleaned_message}",
         refresh=False
     )
 
 
-def generate_general_response():
+def generate_general_response(nickname):
     """Generate a general response from the LLM model for the current backlog."""
 
     if not st.session_state.model_data:
-        return
-
-    llm = st.session_state.model_data
-
-    return llm.create_chat_completion(
-        messages=[
-            {
-                "role": "assistant",
-                "content": st.session_state.llm_role
-            },
-            {
-                "role": "user",
-                "content": f"[INST]{st.session_state.llm_preprompt}[/INST] {st.session_state.generated_content}"
-            }
-        ],
-        max_tokens=st.session_state.llm_maximum_tokens,
-        temperature=st.session_state.llm_temperature,
-        top_p=st.session_state.llm_top_p,
-        top_k=st.session_state.llm_top_k,
-        repeat_penalty=st.session_state.llm_repeat_penalty
-    )
-
-
-def generate_direct_response(user, message):
-    """Generate a direct response from the LLM model for a user ping."""
-
-    if not st.session_state.model_data:
-        return
+        return "No model loaded!"
 
     llm = st.session_state.model_data
 
     result = llm.create_chat_completion(
         messages=[
-            {
-                "role": "assistant", "content": st.session_state.llm_role
-            },
+            {"role": "assistant", "content": st.session_state.llm_role},
             {
                 "role": "user",
-                "content": f"{st.session_state.llm_preprompt}: {message}"
+                "content": f"The previous messages in this channel are the following:\n{"\n".join(st.session_state.irc_log)}\n\nYou are '{nickname}' in this chat.\n\n[INST]{st.session_state.llm_preprompt}What is your response to these messages?[/INST]"
             }
         ],
         max_tokens=st.session_state.llm_maximum_tokens,
@@ -142,9 +87,38 @@ def generate_direct_response(user, message):
         repeat_penalty=st.session_state.llm_repeat_penalty
     )
 
-    print(result["choices"][0]["message"]["content"])
+    # I don't like this either. I'm just trying to get the first response.
+    message = result["choices"][0]["message"]["content"]
 
-    return result["choices"][0]["message"]["content"]
+    return message if len(message) > 0 else "(Empty response)"
+
+
+def generate_direct_response(nickname, user, message):
+    """Generate a direct response from the LLM model for a user ping."""
+
+    if not st.session_state.model_data:
+        return "No model loaded!"
+
+    llm = st.session_state.model_data
+
+    result = llm.create_chat_completion(
+        messages=[
+            {"role": "assistant", "content": st.session_state.llm_role},
+            {
+                "role": "user",
+                "content": f"The previous messages in this channel are the following:\n{"\n".join(st.session_state.irc_log)}\n\nYou are '{nickname}' in this chat responding to '{user}' who just mentioned you saying '{message}'.\n\n[INST]{st.session_state.llm_preprompt}Respond to the message you were mentioned in.[/INST]"
+            }
+        ],
+        max_tokens=st.session_state.llm_maximum_tokens,
+        temperature=st.session_state.llm_temperature,
+        top_p=st.session_state.llm_top_p,
+        top_k=st.session_state.llm_top_k,
+        repeat_penalty=st.session_state.llm_repeat_penalty
+    )
+
+    message = result["choices"][0]["message"]["content"]
+
+    return message if len(message) > 0 else "(Empty response)"
 
 
 def add_to_irc_log(message, refresh=True):
@@ -152,7 +126,7 @@ def add_to_irc_log(message, refresh=True):
     st.session_state.irc_log.append(message)
 
     if len(st.session_state.irc_log) > st.session_state.irc_log_length:
-        st.session_state.irc_log.pop(0)
+        st.session_state.irc_log = st.session_state.irc_log[-st.session_state.irc_log_length:]
 
     if refresh:
         st.rerun()
@@ -201,42 +175,57 @@ def section_irc_connect():
                 )
 
                 response = generate_direct_response(
-                    event.source.nick, event.arguments[0]
+                    connection.username, event.source.nick, event.arguments[0]
                 )
 
-                if response:
-                    send_to_user(event.source.nick,
-                                 connection.username, response)
+                send_to_user(
+                    event.source.nick,
+                    connection.username,
+                    response
+                )
 
         def on_pubmsg(connection: irc.client.ServerConnection, event: irc.client.Event):
             if event.source.nick != connection.username:
-                if event.arguments[0].startswith(f"{connection.username},"):
-                    # Add the message to the IRC log.
-                    add_to_irc_log(f"{event.target} <{
-                        event.source.nick}>: {event.arguments[0]}",
-                        refresh=False
-                    )
+                # Add the incoming message to the IRC log but don't refresh yet since we're about to process it.
+                add_to_irc_log(f"{event.target} <{
+                    event.source.nick}>: {event.arguments[0]}",
+                    refresh=False
+                )
 
-                    query = event.arguments[0].removeprefix(
-                        f'{connection.username},').strip().title()
-
+                if connection.username in event.arguments[0]:
                     response = generate_direct_response(
-                        event.source.nick, query
+                        connection.username, event.source.nick, event.arguments[0]
                     )
 
-                    if response:
+                    send_to_channel(
+                        event.target,
+                        connection.username,
+                        response
+                    )
+
+                if st.session_state.autorespond_enabled:
+                    st.session_state.autorespond_counter = (
+                        st.session_state.autorespond_counter + 1) % st.session_state.autorespond_interval
+
+                    if st.session_state.autorespond_counter == 0:
+                        response = generate_general_response(
+                            connection.username
+                        )
+
                         send_to_channel(
-                            event.target, connection.username, response)
+                            event.target,
+                            connection.username,
+                            response
+                        )
 
-                else:
-                    add_to_irc_log(
-                        f"{event.target} <{
-                            event.source.nick}>: {event.arguments[0]}"
-                    )
+                # send_to_channel blocks - if we reach this, we refresh since the last message is there.
+                st.rerun()
 
         def on_action(connection: irc.client.ServerConnection, event: irc.client.Event):
-            add_to_irc_log(f"Action in {event.target} from {
-                event.source.nick}: {event.arguments[0]}")
+            add_to_irc_log(
+                f"Action in {event.target} from {
+                    event.source.nick}: {event.arguments[0]}"
+            )
 
         try:
             # Create the SSL factory for the IRC connection over TLS.
@@ -281,9 +270,7 @@ def section_irc_connect():
 def handle_irc_log_length():
     """Handle the IRC log length slider."""
     if len(st.session_state.irc_log) > st.session_state.irc_log_length:
-        st.session_state.irc_log = st.session_state.irc_log[st.session_state.irc_log_length:]
-
-        st.rerun()
+        st.session_state.irc_log = st.session_state.irc_log[-st.session_state.irc_log_length:]
 
 
 def section_irc_content():
@@ -292,7 +279,20 @@ def section_irc_content():
 
     st.header("IRC")
 
-    st.slider("Backlog Length", 0, 250, DEFAULT_BACKLOG_LENGTH, 1,
+    st.checkbox(
+        "Autorespond",
+        value=DEFAULT_AUTORESPOND_ENABLED,
+        key="autorespond_enabled"
+    )
+
+    st.slider(
+        "Autorespond Interval",
+        1, 100, DEFAULT_AUTORESPOND_INTERVAL, 1,
+        key="autorespond_interval",
+        disabled=not st.session_state.autorespond_enabled
+    )
+
+    st.slider("Backlog Length / Context size", 1, 250, DEFAULT_BACKLOG_LENGTH, 1,
               on_change=handle_irc_log_length, key="irc_log_length")
 
     if st.button("Disconnect"):
@@ -311,7 +311,67 @@ def section_irc_content():
         st.code("\n".join(st.session_state.irc_log), language="text")
 
 
-def section_prompt_response(llm, role, prompt, parameters={
+@ st.cache_resource
+def load_model(model_path, context_length=2048):
+    """Load a Llama model from a given path.
+
+    Args:
+        model_path (str): The path to the model file.
+    """
+    llm = Llama(model_path, seed=-1, n_ctx=context_length)
+
+    return llm
+
+
+def section_model_load():
+    """Load the LLM model as a Streamlit section."""
+
+    if st.session_state.model_data:
+        return
+
+    st.header("Model")
+
+    context_length = st.slider(
+        "Context Length",
+        0, 8192, 2048, 1,
+        key="llm_context_length"
+    )
+
+    # Get the model files in the models directory.
+    models = os.listdir(MODELS_PATH)
+
+    model_path = st.selectbox(
+        "Select a model to load:",
+        models
+    )
+
+    direct_model_path = st.text_input(
+        "Alternatively enter a direct path:", "")
+
+    if st.button("Load"):
+        if direct_model_path != "":
+            model_path = direct_model_path
+
+        # Check if a model path is provided
+        if model_path:
+            # Check if the model path is a direct path or a relative path.
+            if direct_model_path == "":
+                model_path = os.path.join(MODELS_PATH, model_path)
+
+            st.spinner("Loading model...")
+
+            # Load the model
+            llm = load_model(model_path, context_length)
+
+            st.session_state.model_data = llm
+
+            # Since the fundamental state of the app has changed, re-run the app.
+            st.rerun()
+
+    return
+
+
+def section_model_prompt_response(llm, role, prompt, parameters={
     "maximum_tokens": 256,
     "temperature": 0.7,
     "top_p": 0.95,
@@ -337,9 +397,12 @@ def section_prompt_response(llm, role, prompt, parameters={
     if st.session_state.regenerate or st.session_state.generated_content:
         st.header("Response")
 
-        if st.button("Send"):
-            send_to_channel(st.session_state.irc_channel,
-                            st.session_state.generated_content)
+        if st.button("Send to IRC"):
+            send_to_channel(
+                st.session_state.irc_channel,
+                st.session_state.irc_nickname,
+                st.session_state.generated_content
+            )
 
             st.session_state.generated_content = ""
 
@@ -393,21 +456,24 @@ def clear_model():
     del st.session_state.model_data
 
 
-def section_prompt():
+def section_model_prompt():
     """Prompt the user for input and generate a response from the LLM model as a Streamlit section."""
 
     if not st.session_state.model_data:
         return
 
-    st.header("Prompt")
+    st.header("Model")
 
     with st.sidebar:
 
-        st.title("Model")
+        st.title("Model Parameters")
 
         st.code(st.session_state.model_data.model_path)
 
-        st.button("Change Model", on_click=clear_model)
+        if st.button("Change Model"):
+            clear_model()
+
+            st.rerun()
 
         st.title("Parameters")
 
@@ -455,17 +521,17 @@ def section_prompt():
 
     # Text Input for user's prompt
     user_input = st.text_area(
-        "Enter a manual prompt:",
-        DEFAULT_PROMPT
+        "Enter a prompt:",
+        DEFAULT_PROMPT,
     )
 
     if st.button("Generate!"):
         st.session_state.regenerate = True
 
-    section_prompt_response(
+    section_model_prompt_response(
         st.session_state.model_data,
         role_input,
-        f"{preprompt_input}: {user_input}",
+        f"[INST]{preprompt_input}[/INST]\n{user_input}",
         parameters={
             "maximum_tokens": maximum_tokens_slider,
             "temperature": temperature_slider,
@@ -512,6 +578,15 @@ def initialize_state():
     if "irc_log_length" not in st.session_state:
         st.session_state.irc_log_length = DEFAULT_BACKLOG_LENGTH
 
+    if "autorespond_enabled" not in st.session_state:
+        st.session_state.autorespond_enabled = DEFAULT_AUTORESPOND_ENABLED
+
+    if "autorespond_interval" not in st.session_state:
+        st.session_state.autorespond_interval = DEFAULT_AUTORESPOND_INTERVAL
+
+    if "autorespond_counter" not in st.session_state:
+        st.session_state.autorespond_counter = 0
+
 
 def main():
     """Run the Streamlit application."""
@@ -523,23 +598,23 @@ def main():
     )
 
     # Streamlit application title
-    st.title("Interactive LLM Prompt")
+    st.title("IRC LLM Bot")
 
     section_irc_connect()
 
     section_irc_content()
 
-    section_load_model()
+    st.divider()
 
-    section_prompt()
+    section_model_load()
+
+    section_model_prompt()
 
     while True:
         time.sleep(.1)
 
         if st.session_state.irc_connection:
             st.session_state.irc_client.process_once()
-
-            st.rerun()
 
 
 if __name__ == "__main__":

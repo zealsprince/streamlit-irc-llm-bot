@@ -1,6 +1,8 @@
 
 # Streamlit IRC LLM Bot #
 
+This is a bot written on top of Streamlit to interface with an IRC channel and respond to queries when mentioned.
+
 ## Setup ##
 
 First, create your Python virtual environment via the following command:
