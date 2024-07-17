@@ -1,3 +1,4 @@
+[![build](https://github.com/zealsprince/streamlit-irc-llm-bot/actions/workflows/build.yml/badge.svg)](https://github.com/zealsprince/streamlit-irc-llm-bot/actions/workflows/build.yml)
 
 # Streamlit IRC LLM Bot #
 
