@@ -2,6 +2,7 @@ import os
 import sys
 
 import streamlit.web.cli as stcli
+import streamlit.runtime.scriptrunner.magic_funcs
 
 # Import dependencies here to make sure they're included in the build
 import streamlit
